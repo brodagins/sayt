@@ -15,10 +15,13 @@ import os
 import socket
 import sys
 import threading
+import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+import checker
 import database as db
 from csv_tools import HEADER_SYNONYMS, export_csv, import_csv, template_csv
 
@@ -84,6 +87,10 @@ td select { font-size:13px; padding:3px 5px; }
 .group .reasons { color:var(--warn); font-size:14px; margin-bottom:8px; }
 .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
 code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+.note { font-size:12px; color:var(--muted); margin-top:3px; max-width:320px; }
+.st-yes { color:var(--ok); font-weight:600; } .st-no { color:var(--danger); font-weight:600; }
+.progress { height:10px; background:var(--bg); border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:10px 0; }
+.progress div { height:100%; background:var(--accent); }
 a { color:var(--accent); }
 """
 
@@ -91,13 +98,15 @@ NAV = [
     ("/", "Компании"),
     ("/import", "Загрузить CSV"),
     ("/add", "Добавить вручную"),
+    ("/check", "Проверка сайтов"),
     ("/duplicates", "Дубликаты"),
     ("/export", "Экспорт"),
+    ("/settings", "Настройки"),
     ("/help", "Справка"),
 ]
 
 
-def page(title, body, active="", message="", error=""):
+def page(title, body, active="", message="", error="", refresh=0):
     nav = "".join(
         '<a href="%s"%s>%s</a>' % (href, ' class="active"' if href == active else "", e(label))
         for href, label in NAV
@@ -109,10 +118,12 @@ def page(title, body, active="", message="", error=""):
         notice += '<div class="msg error">%s</div>' % e(error)
     return """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">%s
 <title>%s — База клиентов</title><style>%s</style></head>
 <body><header><span class="logo">База клиентов</span>%s</header>
-<main>%s<h1>%s</h1>%s</main></body></html>""" % (e(title), STYLE, nav, notice, e(title), body)
+<main>%s<h1>%s</h1>%s</main></body></html>""" % (
+        '<meta http-equiv="refresh" content="%d">' % refresh if refresh else "",
+        e(title), STYLE, nav, notice, e(title), body)
 
 
 def options(values, selected, empty_label=None):
@@ -181,12 +192,17 @@ def list_page(conn, params):
       <a class="btn" href="/">Сбросить</a>
       <span style="flex:1"></span>
       <a class="btn" href="/export.csv?%s">Скачать эти записи для Excel</a>
+    </form>
+    <form method="post" action="/check/start" style="margin:-6px 0 14px">
+      <input type="hidden" name="mode" value="unchecked">%s
+      <button type="submit">Проверить сайты у компаний со статусом «не проверено» в этом списке</button>
     </form>""" % (
         e(q),
         options(db.distinct_values(conn, "city"), city, "Все города"),
         options(db.distinct_values(conn, "category"), category, "Все категории"),
         options(db.STATUSES, status, "Все статусы"),
         e(urlencode(dict(active_filters, format="excel"))),
+        "".join('<input type="hidden" name="%s" value="%s">' % (k, e(v)) for k, v in active_filters.items()),
     )
 
     if not rows:
@@ -206,11 +222,11 @@ def list_page(conn, params):
               <td><form method="post" action="/status">
                 <input type="hidden" name="id" value="%d"><input type="hidden" name="back" value="%s">
                 <select name="status" onchange="this.form.submit()">%s</select>
-                <noscript><button type="submit">OK</button></noscript></form></td>
+                <noscript><button type="submit">OK</button></noscript></form>%s</td>
             </tr>""" % (
                 c["id"], e(c["name"]), e(c["city"]), e(c["category"]), e(c["phone"]),
                 e(c["address"]), website_link(c["website"]), search_link(c), e(c["source"]),
-                c["id"], e(back), options(db.STATUSES, c["status"]),
+                c["id"], e(back), options(db.STATUSES, c["status"]), check_note_html(c),
             ))
         table = """<div class="table-wrap"><table>
           <tr><th>Название компании</th><th>Город</th><th>Категория бизнеса</th><th>Телефон</th>
@@ -234,6 +250,13 @@ def list_page(conn, params):
     return stats + form + table + pager
 
 
+def check_note_html(company):
+    if not company.get("check_note"):
+        return ""
+    return '<div class="note" title="Проверено: %s">%s</div>' % (
+        e(company.get("checked_at")), e(company["check_note"]))
+
+
 def company_form(company, action, submit_label):
     fields = ""
     for name, label in db.FIELDS:
@@ -246,7 +269,8 @@ def company_form(company, action, submit_label):
     hidden = '<input type="hidden" name="id" value="%d">' % company["id"] if company.get("id") else ""
     return """<form class="card" method="post" action="%s">%s
       <div class="form-grid">%s</div>
-      <p class="muted">* — обязательное поле. Если сайт неизвестен, оставьте поле пустым и статус «не проверено».</p>
+      <p class="muted">* — обязательное поле. Если сайт неизвестен, оставьте поле пустым:
+      кнопка «Проверить сайт» найдёт его автоматически (если подключён поиск в «Настройках»).</p>
       <div class="actions"><button class="primary" type="submit">%s</button>
       <a class="btn" href="/">Отмена</a></div></form>""" % (action, hidden, fields, e(submit_label))
 
@@ -386,27 +410,228 @@ def help_page():
       <li><b>Загрузить CSV</b> — добавьте компании из таблицы. Первая строка таблицы — заголовки столбцов.</li>
       <li><b>Компании</b> — поиск, фильтры по городу, категории и статусу. Статус можно менять прямо в таблице.
           Щелчок по названию открывает карточку компании для правки или удаления.</li>
-      <li>Ссылка «искать сайт» открывает обычный поиск в Яндексе — проверьте результат сами
-          и поставьте нужный статус.</li>
+      <li><b>Проверка сайтов</b> — программа сама определяет, есть ли у компании сайт, и ставит статус.
+          Одну компанию можно проверить кнопкой «Проверить сайт сейчас» в её карточке.</li>
+      <li><b>Настройки</b> — подключение поиска Яндекса, чтобы находить сайты компаний, у которых сайт не указан.</li>
       <li><b>Дубликаты</b> — программа находит записи с одинаковым телефоном, сайтом
           или одинаковыми названием, городом и адресом. Решение — объединить, удалить или оставить — принимаете вы.</li>
       <li><b>Экспорт</b> — скачать базу в CSV для Excel.</li>
     </ol>
     <h2>Статусы проверки</h2>
     <ul>
-      <li><b>не проверено</b> — сайт ещё никто не проверял. Ставится автоматически для всех новых записей,
-          в том числе если в данных нет сайта: отсутствие сайта в таблице не доказывает, что сайта нет.</li>
-      <li><b>сайт найден</b> — вы проверили и нашли сайт.</li>
-      <li><b>сайт не найден (проверено вручную)</b> — вы проверили и сайта не нашли.</li>
-      <li><b>сайт устарел</b> — сайт есть, но старый или неудобный (тоже повод предложить новый).</li>
-      <li><b>нужна повторная проверка</b> — есть сомнения, нужно перепроверить позже.</li>
+      <li><b>сайт есть</b> — сайт указан и работает, или найден поиском и совпал с компанией
+          (на сайте тот же телефон или название совпадает с адресом сайта).</li>
+      <li><b>сайт не найден</b> — в данных сайта нет, и в первых результатах поиска Яндекса сайта компании нет.</li>
+      <li><b>только соцсети</b> — собственного сайта не найдено, есть только страница в соцсети.</li>
+      <li><b>сайт не открывается</b> — сайт указан, но не работает: домен не существует, ошибка,
+          или на адресе страница «домен продаётся».</li>
+      <li><b>нужна повторная проверка</b> — поиск нашёл похожий сайт, но уверенности нет: проверьте вручную
+          (адрес указан в пояснении).</li>
+      <li><b>не проверено</b> — проверку ещё не запускали, или сайт не указан, а поиск Яндекса не подключён.</li>
+      <li><b>сайт устарел</b> — ставите вы сами, если сайт есть, но старый. Проверка этот статус не меняет.</li>
     </ul>
+    <p>Под статусом в таблице мелким шрифтом написано, на чём основан результат.
+       Ссылка «искать сайт» открывает обычный поиск Яндекса, чтобы перепроверить вручную.</p>
     <h2>Важно</h2>
     <ul>
-      <li>Программа не собирает данные с сайтов сама и ничего не придумывает: в базе только то, что вы загрузили или ввели.</li>
+      <li>Программа ничего не придумывает: компании в базе — только те, что вы загрузили или ввели.
+          При проверке она открывает главную страницу сайта компании (один запрос, как обычный браузер)
+          и пользуется официальным API поиска Яндекса. Капчи и защиту сайтов она не обходит.</li>
       <li>Используйте только данные, которые получены законно и с соблюдением правил источника.</li>
       <li>Чтобы остановить программу, закройте окно «Терминал», в котором она запущена.</li>
     </ul></div>"""
+
+
+# ---------------------------------------------------------------------------
+# Проверка сайтов
+# ---------------------------------------------------------------------------
+
+class CheckJob:
+    """Проверка сайтов в фоне, чтобы можно было смотреть, как она идёт."""
+
+    WORKERS = 8
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.reset(0)
+
+    def reset(self, total):
+        self.total = total
+        self.done = 0
+        self.counts = {}
+        self.recent = []
+        self.error = ""
+        self.cancel = False
+        self.started = db.now()
+        self.finished = ""
+
+    @property
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, companies):
+        with self.lock:
+            if self.running:
+                return False
+            self.reset(len(companies))
+            self.thread = threading.Thread(target=self._run, args=(companies,), daemon=True)
+            self.thread.start()
+            return True
+
+    def _run(self, companies):
+        settings = checker.load_settings()
+        search_lock = threading.Lock()
+
+        def polite_search(query, s):
+            # Запросы к поиску — по одному, с небольшой паузой.
+            with search_lock:
+                time.sleep(0.3)
+                return checker.yandex_search(query, s)
+
+        conn = db.connect()
+        try:
+            with ThreadPoolExecutor(max_workers=self.WORKERS) as pool:
+                futures = {pool.submit(checker.check_company, c, settings, polite_search): c
+                           for c in companies}
+                for future in as_completed(futures):
+                    company = futures[future]
+                    if self.cancel:
+                        for other in futures:
+                            other.cancel()
+                        break
+                    try:
+                        result = future.result()
+                    except checker.SearchError as exc:
+                        self.error = str(exc)
+                        self.cancel = True
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        result = {"status": company["status"],
+                                  "note": "проверка не удалась: %s" % exc, "website": None}
+                    save_result(conn, company, result)
+                    with self.lock:
+                        self.done += 1
+                        self.counts[result["status"]] = self.counts.get(result["status"], 0) + 1
+                        self.recent.insert(0, (company, result))
+                        del self.recent[30:]
+        finally:
+            conn.close()
+            self.finished = db.now()
+
+
+JOB = CheckJob()
+
+
+def save_result(conn, company, result):
+    status = result["status"]
+    # «сайт устарел» — оценка человека; если сайт работает, оставляем её.
+    if company["status"] not in db.AUTO_STATUSES and status == "сайт есть":
+        status = company["status"]
+    db.save_check_result(conn, company["id"], status, result["note"], result.get("website"))
+
+
+def companies_to_check(conn, mode, filters):
+    rows, _ = db.search_companies(conn, filters.get("q", ""), filters.get("city", ""),
+                                  filters.get("category", ""), filters.get("status", ""))
+    if mode == "unchecked":
+        rows = [r for r in rows if r["status"] == db.DEFAULT_STATUS]
+    return rows
+
+
+def status_class(status):
+    if status == "сайт есть":
+        return "st-yes"
+    if status in ("сайт не найден", "только соцсети", "сайт не открывается"):
+        return "st-no"
+    return ""
+
+
+def check_page(conn):
+    settings = checker.load_settings()
+    rows, total = db.search_companies(conn)
+    unchecked = [r for r in rows if r["status"] == db.DEFAULT_STATUS]
+    need_search = sum(1 for r in unchecked if checker.classify_website(r["website"]) != "site")
+    if checker.search_configured(settings):
+        search_info = ('<p>Поиск Яндекса <b>подключён</b>. Компаниям без сайта в данных программа найдёт сайт '
+                       'через поиск. Среди непроверенных таких компаний: <b>%d</b> — столько платных '
+                       'запросов к поиску потребуется.</p>' % need_search)
+    else:
+        search_info = ('<p class="msg error" style="margin:0 0 10px">Поиск Яндекса не подключён. '
+                       'Программа проверит только сайты, которые уже указаны в данных. '
+                       'Компании без сайта (%d среди непроверенных) останутся «не проверено». '
+                       '<a href="/settings">Подключить поиск</a></p>' % need_search)
+
+    body = """<div class="card">
+      <p>Программа сама определяет, есть ли у компании сайт:</p>
+      <ul>
+        <li>если сайт указан — открывает его и проверяет, что он работает
+            (а не выдаёт ошибку или страницу «домен продаётся»);</li>
+        <li>если сайт не указан — ищет его через поиск Яндекса и сверяет найденный сайт
+            с компанией (по телефону на сайте и по названию).</li>
+      </ul>%s
+      <form method="post" action="/check/start" class="actions">
+        <button class="primary" name="mode" value="unchecked"%s>Проверить непроверенные (%d)</button>
+        <button name="mode" value="all"%s onclick="return confirm('Проверить заново все %d компаний?')">Проверить все заново (%d)</button>
+      </form>
+      <p class="muted">Статус «сайт устарел», поставленный вами, проверка не меняет, если сайт работает.
+      Проверка тысячи компаний занимает несколько минут. Программу в это время закрывать нельзя.</p>
+    </div>""" % (search_info, " disabled" if JOB.running else "", len(unchecked),
+                 " disabled" if JOB.running else "", total, total)
+
+    if JOB.total or JOB.running:
+        percent = int(100 * JOB.done / JOB.total) if JOB.total else 100
+        state = "Идёт проверка…" if JOB.running else "Проверка завершена (%s)." % e(JOB.finished)
+        if JOB.cancel and not JOB.running and not JOB.error:
+            state = "Проверка остановлена."
+        counts = " · ".join('<span class="%s">%s</span>: %d' % (status_class(k), e(k), v)
+                           for k, v in sorted(JOB.counts.items(), key=lambda kv: -kv[1]))
+        recent = "".join(
+            '<tr><td><a href="/edit?id=%d">%s</a></td><td>%s</td><td class="%s">%s</td><td class="muted">%s</td></tr>' % (
+                c["id"], e(c["name"]), website_link(r.get("website") or c["website"]),
+                status_class(r["status"]), e(r["status"]), e(r["note"]))
+            for c, r in list(JOB.recent))
+        body += """<div class="card"><h2 style="margin-top:0">%s</h2>
+          <div class="progress"><div style="width:%d%%"></div></div>
+          <p>Проверено %d из %d. %s</p>%s%s
+          <div class="table-wrap"><table><tr><th>Компания</th><th>Сайт</th><th>Результат</th><th>Пояснение</th></tr>%s</table></div>
+        </div>""" % (
+            state, percent, JOB.done, JOB.total, counts,
+            '<div class="msg error">%s</div>' % e(JOB.error) if JOB.error else "",
+            '<form method="post" action="/check/stop"><button class="danger">Остановить</button></form>'
+            if JOB.running else '<p><a class="btn primary" href="/">Открыть базу</a></p>',
+            recent)
+    return body
+
+
+def settings_page():
+    settings = checker.load_settings()
+    has_key = bool(settings["yandex_api_key"])
+    return """<form class="card" method="post" action="/settings">
+      <h2 style="margin-top:0">Поиск Яндекса (для компаний без сайта в данных)</h2>
+      <p>Чтобы находить сайты компаний, у которых сайт не указан, программа пользуется
+         официальным API поиска Яндекса — <b>Yandex Search API</b> в Yandex Cloud.
+         Это платная услуга: оплата за количество запросов (одна компания — один запрос),
+         цены — на сайте Yandex Cloud. Как получить ключ — в файле README.md, раздел
+         «Подключение поиска Яндекса».</p>
+      <div class="form-grid">
+        <label for="key">API-ключ</label>
+        <input type="password" id="key" name="yandex_api_key" autocomplete="off"
+               placeholder="%s">
+        <label for="folder">Идентификатор каталога</label>
+        <input type="text" id="folder" name="yandex_folder_id" value="%s" placeholder="например: b1g…">
+      </div>
+      <p class="muted">Ключ хранится только на этом компьютере, в файле <code>%s</code>.</p>
+      <div class="actions">
+        <button class="primary" name="action" value="save">Сохранить</button>
+        <button name="action" value="test">Сохранить и проверить подключение</button>
+        %s
+      </div>
+    </form>""" % (
+        "ключ сохранён — оставьте пустым, чтобы не менять" if has_key else "вставьте ключ",
+        e(settings["yandex_folder_id"]), e(checker.SETTINGS_PATH),
+        '<button class="danger" name="action" value="delete" onclick="return confirm(\'Удалить ключ?\')">Удалить ключ</button>'
+        if has_key else "")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +754,17 @@ class Handler(BaseHTTPRequestHandler):
                 company = db.get_company(conn, _int(params.get("id")))
                 if not company:
                     return self.redirect("/", error="Компания не найдена.")
-                body = company_form(company, "/edit", "Сохранить")
+                body = """<div class="card"><b>Есть ли сайт:</b>
+                    <span class="%s">%s</span>%s
+                    <form method="post" action="/check-one" class="actions">
+                      <input type="hidden" name="id" value="%d">
+                      <button class="primary" type="submit">Проверить сайт сейчас</button>
+                    </form></div>""" % (
+                    status_class(company["status"]), e(company["status"]),
+                    '<div class="muted" style="margin-top:4px">%s <span style="font-size:13px">(%s)</span></div>' % (
+                        e(company["check_note"]), e(company["checked_at"])) if company["check_note"] else "",
+                    company["id"])
+                body += company_form(company, "/edit", "Сохранить")
                 body += """<form class="card" method="post" action="/delete"
                     onsubmit="return confirm('Удалить эту компанию?')">
                     <input type="hidden" name="id" value="%d">
@@ -539,6 +774,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(page(company["name"] or "Компания", body, "", msg, err))
             elif path == "/duplicates":
                 self.send_html(page("Дубликаты", duplicates_page(conn), "/duplicates", msg, err))
+            elif path == "/check":
+                self.send_html(page("Проверка сайтов", check_page(conn), "/check", msg, err,
+                                    refresh=2 if JOB.running else 0))
+            elif path == "/settings":
+                self.send_html(page("Настройки", settings_page(), "/settings", msg, err))
             elif path == "/export":
                 self.send_html(page("Экспорт", export_page(conn), "/export", msg, err))
             elif path == "/export.csv":
@@ -600,6 +840,45 @@ class Handler(BaseHTTPRequestHandler):
                 if not back.startswith("/") or back.startswith("//"):
                     back = "/"
                 self.redirect(back)
+            elif path == "/check/start":
+                companies = companies_to_check(conn, f("mode"), {k: f(k) for k in ("q", "city", "category", "status")})
+                if not companies:
+                    return self.redirect("/check", message="Нет компаний для проверки.")
+                if not JOB.start(companies):
+                    return self.redirect("/check", error="Проверка уже идёт.")
+                self.redirect("/check")
+            elif path == "/check/stop":
+                JOB.cancel = True
+                self.redirect("/check", message="Проверка останавливается…")
+            elif path == "/check-one":
+                company = db.get_company(conn, _int(f("id")))
+                if not company:
+                    return self.redirect("/", error="Компания не найдена.")
+                try:
+                    result = checker.check_company(company, checker.load_settings())
+                except checker.SearchError as exc:
+                    return self.redirect("/edit?id=%d" % company["id"], error=str(exc))
+                save_result(conn, company, result)
+                self.redirect("/edit?id=%d" % company["id"], message="Проверено: %s." % result["status"])
+            elif path == "/settings":
+                settings = checker.load_settings()
+                action = f("action")
+                if action == "delete":
+                    settings["yandex_api_key"] = ""
+                else:
+                    if f("yandex_api_key").strip():
+                        settings["yandex_api_key"] = f("yandex_api_key").strip()
+                    settings["yandex_folder_id"] = f("yandex_folder_id").strip()
+                checker.save_settings(settings)
+                if action == "test":
+                    if not checker.search_configured(settings):
+                        return self.redirect("/settings", error="Укажите и ключ, и идентификатор каталога.")
+                    try:
+                        found = checker.yandex_search("Яндекс", settings)
+                    except checker.SearchError as exc:
+                        return self.redirect("/settings", error=str(exc))
+                    return self.redirect("/settings", message="Подключение работает: поиск вернул %d результатов." % len(found))
+                self.redirect("/settings", message="Настройки сохранены.")
             elif path == "/delete":
                 db.delete_companies(conn, [_int(f("id"))])
                 self.redirect("/", message="Компания удалена.")

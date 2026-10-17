@@ -23,16 +23,40 @@ FIELDS = [
 FIELD_NAMES = [name for name, _ in FIELDS]
 LABELS = dict(FIELDS)
 
-# Статус по умолчанию. Если сайт в данных не указан, это НЕ значит,
-# что сайта нет: значит только, что мы его ещё не проверяли.
+# Статус по умолчанию: сайт ещё не проверяли.
 DEFAULT_STATUS = "не проверено"
 STATUSES = [
     DEFAULT_STATUS,
-    "сайт найден",
-    "сайт не найден (проверено вручную)",
+    "сайт есть",
+    "сайт не найден",
+    "только соцсети",
+    "сайт не открывается",
     "сайт устарел",
     "нужна повторная проверка",
 ]
+# Старые и другие написания статусов (например, из загружаемых таблиц).
+STATUS_ALIASES = {
+    "сайт найден": "сайт есть",
+    "есть сайт": "сайт есть",
+    "есть": "сайт есть",
+    "сайт не найден (проверено вручную)": "сайт не найден",
+    "нет сайта": "сайт не найден",
+    "сайта нет": "сайт не найден",
+    "нет": "сайт не найден",
+}
+# Эти статусы автоматическая проверка может заменить.
+# «сайт устарел» — оценка человека, её проверка не трогает, если сайт работает.
+AUTO_STATUSES = {DEFAULT_STATUS, "сайт есть", "сайт не найден", "только соцсети",
+                 "сайт не открывается", "нужна повторная проверка"}
+
+# Поля с результатом автоматической проверки (заполняет программа).
+CHECK_FIELDS = [
+    ("check_note", "Результат проверки"),
+    ("checked_at", "Дата проверки"),
+]
+ALL_FIELDS = FIELDS + CHECK_FIELDS
+ALL_FIELD_NAMES = [name for name, _ in ALL_FIELDS]
+LABELS.update(dict(CHECK_FIELDS))
 
 MAX_VALUE_LENGTH = 1000
 
@@ -87,6 +111,13 @@ def init_db(conn):
         );
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(companies)")}
+    for name, _ in CHECK_FIELDS:
+        if name not in columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % name)
+    for old, new in (("сайт найден", "сайт есть"),
+                     ("сайт не найден (проверено вручную)", "сайт не найден")):
+        conn.execute("UPDATE companies SET status = ? WHERE status = ?", (new, old))
     conn.commit()
 
 
@@ -107,11 +138,11 @@ def normalize_status(value):
     for status in STATUSES:
         if _lower(status) == wanted:
             return status
-    return DEFAULT_STATUS
+    return STATUS_ALIASES.get(wanted, DEFAULT_STATUS)
 
 
 def clean_company(data):
-    company = {field: clean_value(data.get(field, "")) for field in FIELD_NAMES}
+    company = {field: clean_value(data.get(field, "")) for field in ALL_FIELD_NAMES}
     company["status"] = normalize_status(company["status"])
     return company
 
@@ -125,30 +156,55 @@ def add_company(conn, data, commit=True):
     stamp = now()
     cur = conn.execute(
         "INSERT INTO companies (%s, created_at, updated_at) VALUES (%s, ?, ?)"
-        % (", ".join(FIELD_NAMES), ", ".join("?" for _ in FIELD_NAMES)),
-        [company[f] for f in FIELD_NAMES] + [stamp, stamp],
+        % (", ".join(ALL_FIELD_NAMES), ", ".join("?" for _ in ALL_FIELD_NAMES)),
+        [company[f] for f in ALL_FIELD_NAMES] + [stamp, stamp],
     )
     if commit:
         conn.commit()
     return cur.lastrowid
 
 
-def update_company(conn, company_id, data):
+def update_company(conn, company_id, data, fields=None):
+    """Сохраняет поля компании. Если статус поменял человек,
+    в «Результат проверки» записывается «указано вручную»."""
+    fields = fields or FIELD_NAMES
     company = clean_company(data)
+    old = get_company(conn, company_id)
+    if old and "status" in fields and "check_note" not in fields and company["status"] != old["status"]:
+        fields = list(fields) + ["check_note", "checked_at"]
+        company["check_note"], company["checked_at"] = "статус указан вручную", now()
     conn.execute(
         "UPDATE companies SET %s, updated_at = ? WHERE id = ?"
-        % ", ".join("%s = ?" % f for f in FIELD_NAMES),
-        [company[f] for f in FIELD_NAMES] + [now(), company_id],
+        % ", ".join("%s = ?" % f for f in fields),
+        [company[f] for f in fields] + [now(), company_id],
     )
     conn.commit()
 
 
 def set_status(conn, company_id, status):
     conn.execute(
-        "UPDATE companies SET status = ?, updated_at = ? WHERE id = ?",
-        (normalize_status(status), now(), company_id),
+        "UPDATE companies SET status = ?, check_note = ?, checked_at = ?, updated_at = ? WHERE id = ?",
+        (normalize_status(status), "статус указан вручную", now(), now(), company_id),
     )
     conn.commit()
+
+
+def save_check_result(conn, company_id, status, note, website=None, commit=True):
+    """Записывает результат автоматической проверки."""
+    stamp = now()
+    if website:
+        cur = conn.execute("UPDATE companies SET website = ? WHERE id = ? AND website = ''",
+                           (clean_value(website), company_id))
+    if website and cur.rowcount:
+        conn.execute(
+            "UPDATE companies SET source = CASE WHEN source = '' THEN ? ELSE source || '; ' || ? END "
+            "WHERE id = ?", ("сайт: поиск Яндекса", "сайт: поиск Яндекса", company_id))
+    conn.execute(
+        "UPDATE companies SET status = ?, check_note = ?, checked_at = ?, updated_at = ? WHERE id = ?",
+        (normalize_status(status), clean_value(note), stamp, stamp, company_id),
+    )
+    if commit:
+        conn.commit()
 
 
 def delete_companies(conn, ids):
@@ -399,8 +455,9 @@ def merge_companies(conn, keep_id, ids):
                 sources.append(s.strip())
         if keep["status"] == DEFAULT_STATUS and other["status"] != DEFAULT_STATUS:
             keep["status"] = other["status"]
+            keep["check_note"], keep["checked_at"] = other["check_note"], other["checked_at"]
     keep["source"] = "; ".join(sources)
-    update_company(conn, keep_id, keep)
+    update_company(conn, keep_id, keep, fields=ALL_FIELD_NAMES)
     return delete_companies(conn, [c["id"] for c in other_rows])
 
 

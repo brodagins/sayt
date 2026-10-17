@@ -34,15 +34,15 @@ class ImportTest(BaseTest):
         self.assertEqual(row["source"], "тест")
 
     def test_comma_delimiter_and_synonyms(self):
-        raw = "Компания,Телефон,Статус\nКомпания 1,123456,сайт найден\n".encode("utf-8")
+        raw = "Компания,Телефон,Статус\nКомпания 1,123456,сайт найден\n".encode("utf-8")  # старое название
         parsed = read_csv(raw)
         self.assertEqual(parsed["delimiter"], ",")
         self.assertEqual(parsed["rows"][0]["name"], "Компания 1")
         import_csv(self.conn, raw)
-        self.assertEqual(db.search_companies(self.conn)[0][0]["status"], "сайт найден")
+        self.assertEqual(db.search_companies(self.conn)[0][0]["status"], "сайт есть")
 
     def test_unknown_status_becomes_unchecked(self):
-        raw = "Название;Статус\nКомпания 1;нет сайта\n".encode("utf-8")
+        raw = "Название;Статус\nКомпания 1;что-то непонятное\n".encode("utf-8")
         import_csv(self.conn, raw)
         self.assertEqual(db.search_companies(self.conn)[0][0]["status"], db.DEFAULT_STATUS)
 

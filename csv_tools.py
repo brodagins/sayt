@@ -5,8 +5,9 @@ import io
 import re
 
 from database import (
+    ALL_FIELD_NAMES,
+    ALL_FIELDS,
     DEFAULT_STATUS,
-    FIELD_NAMES,
     FIELDS,
     DuplicateIndex,
     add_company,
@@ -29,6 +30,8 @@ HEADER_SYNONYMS = {
     "website": ["сайт", "веб-сайт", "вебсайт", "website", "site", "url", "web"],
     "source": ["источник данных", "источник", "source"],
     "status": ["статус проверки", "статус", "status"],
+    "check_note": ["результат проверки", "комментарий проверки"],
+    "checked_at": ["дата проверки"],
 }
 
 
@@ -95,7 +98,7 @@ def read_csv(raw):
             unknown.append(header.strip())
     records = []
     for row in rows[1:]:
-        record = {field: "" for field in FIELD_NAMES}
+        record = {field: "" for field in ALL_FIELD_NAMES}
         for index, field in mapping.items():
             if index < len(row):
                 record[field] = _unwrap(row[index])
@@ -185,9 +188,9 @@ def export_csv(companies, for_excel=True):
     """
     out = io.StringIO(newline="")
     writer = csv.writer(out, delimiter=";" if for_excel else ",", lineterminator="\r\n")
-    writer.writerow([label for _, label in FIELDS])
+    writer.writerow([label for _, label in ALL_FIELDS])
     for company in companies:
-        writer.writerow([_safe_cell(f, company.get(f, ""), for_excel) for f in FIELD_NAMES])
+        writer.writerow([_safe_cell(f, company.get(f, ""), for_excel) for f in ALL_FIELD_NAMES])
     data = out.getvalue()
     return ("﻿" + data).encode("utf-8") if for_excel else data.encode("utf-8")
 
